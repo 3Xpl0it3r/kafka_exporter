@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
@@ -21,14 +22,18 @@ import (
 	"github.com/krallistic/kazoo-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	plog "github.com/prometheus/common/promlog"
 	plogflag "github.com/prometheus/common/promlog/flag"
 
-	versionCollector "github.com/prometheus/client_golang/prometheus/collectors/version"
 	"github.com/prometheus/common/version"
 	"github.com/rcrowley/go-metrics"
 	"k8s.io/klog/v2"
+	gokitlog "github.com/go-kit/log"
+
+	"github.com/prometheus/exporter-toolkit/web"
+	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 )
 
 const (
@@ -97,11 +102,6 @@ type kafkaOpts struct {
 	tlsCAFile                string
 	tlsCertFile              string
 	tlsKeyFile               string
-	serverUseTLS             bool
-	serverMutualAuthEnabled  bool
-	serverTlsCAFile          string
-	serverTlsCertFile        string
-	serverTlsKeyFile         string
 	tlsInsecureSkipTLSVerify bool
 	kafkaVersion             string
 	useZooKeeperLag          bool
@@ -177,12 +177,6 @@ func NewExporter(opts kafkaOpts, topicFilter string, topicExclude string, groupF
 	if opts.useSASL {
 		// Convert to lowercase so that SHA512 and SHA256 is still valid
 		opts.saslMechanism = strings.ToLower(opts.saslMechanism)
-
-		saslPassword := opts.saslPassword
-		if saslPassword == "" {
-			saslPassword = os.Getenv("SASL_USER_PASSWORD")
-		}
-
 		switch opts.saslMechanism {
 		case "scram-sha512":
 			config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
@@ -201,7 +195,7 @@ func NewExporter(opts kafkaOpts, topicFilter string, topicExclude string, groupF
 				config.Net.SASL.GSSAPI.KeyTabPath = opts.keyTabPath
 			} else {
 				config.Net.SASL.GSSAPI.AuthType = sarama.KRB5_USER_AUTH
-				config.Net.SASL.GSSAPI.Password = saslPassword
+				config.Net.SASL.GSSAPI.Password = opts.saslPassword
 			}
 			if opts.saslDisablePAFXFast {
 				config.Net.SASL.GSSAPI.DisablePAFXFAST = true
@@ -224,8 +218,8 @@ func NewExporter(opts kafkaOpts, topicFilter string, topicExclude string, groupF
 			config.Net.SASL.User = opts.saslUsername
 		}
 
-		if saslPassword != "" {
-			config.Net.SASL.Password = saslPassword
+		if opts.saslPassword != "" {
+			config.Net.SASL.Password = opts.saslPassword
 		}
 	}
 
@@ -657,27 +651,22 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 						consumergroupCurrentOffset, prometheus.GaugeValue, float64(currentOffset), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
 					)
 					e.mu.Lock()
-					currentPartitionOffset, currentPartitionOffsetError := e.client.GetOffset(topic, partition, sarama.OffsetNewest) 
-					if currentPartitionOffsetError != nil {
-						klog.Errorf("Cannot get current offset of topic %s partition %d: %v", topic, partition, currentPartitionOffsetError)
-					} else {
+					if offset, ok := offset[topic][partition]; ok {
+						// If the topic is consumed by that consumer group, but no offset associated with the partition
+						// forcing lag to -1 to be able to alert on that
 						var lag int64
 						if offsetFetchResponseBlock.Offset == -1 {
 							lag = -1
 						} else {
-							if offset, ok := offset[topic][partition]; ok {
-								if currentPartitionOffset == -1 {
-									currentPartitionOffset = offset
-								}
-							}
-							lag = currentPartitionOffset - offsetFetchResponseBlock.Offset
+							lag = offset - offsetFetchResponseBlock.Offset
 							lagSum += lag
 						}
-		
 						ch <- prometheus.MustNewConstMetric(
 							consumergroupLag, prometheus.GaugeValue, float64(lag), group.GroupId, topic, strconv.FormatInt(int64(partition), 10),
 						)
-					} 
+					} else {
+						klog.Errorf("No offset of topic %s partition %d, cannot get consumer group lag", topic, partition)
+					}
 					e.mu.Unlock()
 				}
 				ch <- prometheus.MustNewConstMetric(
@@ -718,7 +707,7 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) {
 
 func init() {
 	metrics.UseNilMetrics = true
-	prometheus.MustRegister(versionCollector.NewCollector("kafka_exporter"))
+	prometheus.MustRegister(collectors.NewBuildInfoCollector())
 }
 
 //func toFlag(name string, help string) *kingpin.FlagClause {
@@ -759,13 +748,12 @@ func toFlagIntVar(name string, help string, value int, valueString string, targe
 
 func main() {
 	var (
-		listenAddress = toFlagString("web.listen-address", "Address to listen on for web interface and telemetry.", ":9308")
-		metricsPath   = toFlagString("web.telemetry-path", "Path under which to expose metrics.", "/metrics")
-		topicFilter   = toFlagString("topic.filter", "Regex that determines which topics to collect.", ".*")
-		topicExclude  = toFlagString("topic.exclude", "Regex that determines which topics to exclude.", "^$")
-		groupFilter   = toFlagString("group.filter", "Regex that determines which consumer groups to collect.", ".*")
-		groupExclude  = toFlagString("group.exclude", "Regex that determines which consumer groups to exclude.", "^$")
-		logSarama     = toFlagBool("log.enable-sarama", "Turn on Sarama logging, default is false.", false, "false")
+		metricsPath  = toFlagString("web.telemetry-path", "Path under which to expose metrics.", "/metrics")
+		topicFilter  = toFlagString("topic.filter", "Regex that determines which topics to collect.", ".*")
+		topicExclude = toFlagString("topic.exclude", "Regex that determines which topics to exclude.", "^$")
+		groupFilter  = toFlagString("group.filter", "Regex that determines which consumer groups to collect.", ".*")
+		groupExclude = toFlagString("group.exclude", "Regex that determines which consumer groups to exclude.", "^$")
+		logSarama    = toFlagBool("log.enable-sarama", "Turn on Sarama logging, default is false.", false, "false")
 
 		opts = kafkaOpts{}
 	)
@@ -788,11 +776,6 @@ func main() {
 	toFlagStringVar("tls.ca-file", "The optional certificate authority file for Kafka TLS client authentication.", "", &opts.tlsCAFile)
 	toFlagStringVar("tls.cert-file", "The optional certificate file for Kafka client authentication.", "", &opts.tlsCertFile)
 	toFlagStringVar("tls.key-file", "The optional key file for Kafka client authentication.", "", &opts.tlsKeyFile)
-	toFlagBoolVar("server.tls.enabled", "Enable TLS for web server, default is false.", false, "false", &opts.serverUseTLS)
-	toFlagBoolVar("server.tls.mutual-auth-enabled", "Enable TLS client mutual authentication, default is false.", false, "false", &opts.serverMutualAuthEnabled)
-	toFlagStringVar("server.tls.ca-file", "The certificate authority file for the web server.", "", &opts.serverTlsCAFile)
-	toFlagStringVar("server.tls.cert-file", "The certificate file for the web server.", "", &opts.serverTlsCertFile)
-	toFlagStringVar("server.tls.key-file", "The key file for the web server.", "", &opts.serverTlsKeyFile)
 	toFlagBoolVar("tls.insecure-skip-tls-verify", "If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure. Default is false", false, "false", &opts.tlsInsecureSkipTLSVerify)
 	toFlagStringVar("kafka.version", "Kafka broker version", sarama.V2_0_0_0.String(), &opts.kafkaVersion)
 	toFlagBoolVar("use.consumelag.zookeeper", "if you need to use a group from zookeeper, default is false", false, "false", &opts.useZooKeeperLag)
@@ -807,6 +790,7 @@ func main() {
 
 	plConfig := plog.Config{}
 	plogflag.AddFlags(kingpin.CommandLine, &plConfig)
+	toolkitFlags := webflag.AddFlags(kingpin.CommandLine, ":9114")
 	kingpin.Version(version.Print("kafka_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
@@ -823,11 +807,11 @@ func main() {
 		}
 	}
 
-	setup(*listenAddress, *metricsPath, *topicFilter, *topicExclude, *groupFilter, *groupExclude, *logSarama, opts, labels)
+	setup(toolkitFlags, *metricsPath, *topicFilter, *topicExclude, *groupFilter, *groupExclude, *logSarama, opts, labels)
 }
 
 func setup(
-	listenAddress string,
+	toolkitFlags *web.FlagConfig,
 	metricsPath string,
 	topicFilter string,
 	topicExclude string,
@@ -946,6 +930,9 @@ func setup(
 		sarama.Logger = log.New(os.Stdout, "[sarama] ", log.LstdFlags)
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, os.Kill)
+	defer cancel()
+
 	exporter, err := NewExporter(opts, topicFilter, topicExclude, groupFilter, groupExclude)
 	if err != nil {
 		klog.Fatalln(err)
@@ -954,18 +941,26 @@ func setup(
 	prometheus.MustRegister(exporter)
 
 	http.Handle(metricsPath, promhttp.Handler())
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_, err := w.Write([]byte(`<html>
-	        <head><title>Kafka Exporter</title></head>
-	        <body>
-	        <h1>Kafka Exporter</h1>
-	        <p><a href='` + metricsPath + `'>Metrics</a></p>
-	        </body>
-	        </html>`))
-		if err != nil {
-			klog.Error("Error handle / request", err)
+	if metricsPath != "/" && metricsPath != "" {
+		landingConfig := web.LandingConfig{
+			Name:        "Elasticsearch Exporter",
+			Description: "Prometheus Exporter for Elasticsearch servers",
+			Version:     version.Info(),
+			Links: []web.LandingLinks{
+				{
+					Address: metricsPath,
+					Text:    "Metrics",
+				},
+			},
 		}
-	})
+		landingPage, err := web.NewLandingPage(landingConfig)
+		if err != nil {
+			klog.Error("error creating landing page", "err", err)
+			os.Exit(1)
+		}
+		http.Handle("/", landingPage)
+	}
+
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		// need more specific sarama check
 		_, err := w.Write([]byte("ok"))
@@ -974,51 +969,18 @@ func setup(
 		}
 	})
 
-	if opts.serverUseTLS {
-		klog.V(INFO).Infoln("Listening on HTTPS", listenAddress)
+	server := &http.Server{}
+	go func() {
+		if err = web.ListenAndServe(server, toolkitFlags, gokitlog.NewNopLogger()); err != nil {
+			klog.Error("http server quit", "err", err)
+			os.Exit(1)
+		}
+	}()
 
-		_, err := CanReadCertAndKey(opts.serverTlsCertFile, opts.serverTlsKeyFile)
-		if err != nil {
-			klog.Error("error reading server cert and key")
-		}
-
-		clientAuthType := tls.NoClientCert
-		if opts.serverMutualAuthEnabled {
-			clientAuthType = tls.RequireAndVerifyClientCert
-		}
-
-		certPool := x509.NewCertPool()
-		if opts.serverTlsCAFile != "" {
-			if caCert, err := os.ReadFile(opts.serverTlsCAFile); err == nil {
-				certPool.AppendCertsFromPEM(caCert)
-			} else {
-				klog.Error("error reading server ca")
-			}
-		}
-
-		tlsConfig := &tls.Config{
-			ClientCAs:                certPool,
-			ClientAuth:               clientAuthType,
-			MinVersion:               tls.VersionTLS12,
-			CurvePreferences:         []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
-			PreferServerCipherSuites: true,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
-			},
-		}
-		server := &http.Server{
-			Addr:      listenAddress,
-			TLSConfig: tlsConfig,
-		}
-		klog.Fatal(server.ListenAndServeTLS(opts.serverTlsCertFile, opts.serverTlsKeyFile))
-	} else {
-		klog.V(INFO).Infoln("Listening on HTTP", listenAddress)
-		klog.Fatal(http.ListenAndServe(listenAddress, nil))
-	}
+	<-ctx.Done()
+	klog.Info("shutting down")
+	// create a context for graceful http server shutdown
+	srvCtx, srvCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer srvCancel()
+	_ = server.Shutdown(srvCtx)
 }
